@@ -1,0 +1,148 @@
+name: build-apk
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+  schedule:
+    - cron: '17 */6 * * *'
+
+jobs:
+  # Job 1: Trimmed Android NDK r27c release mein publish karta hai (sirf ek baar)
+  tools:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish the trimmed NDK (once)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release download tools --pattern ndk-lite-r27c.tar.xz.sha256 -O /tmp/have.sha 2>/dev/null; then
+            echo "already published"
+            exit 0
+          fi
+          bash tools/make_ndk_lite.sh
+          gh release create tools --prerelease \
+            --title "Build tools (trimmed Android NDK)" \
+            --notes "Only the parts of NDK r27c that the ARM host build reads. Made by tools/make_ndk_lite.sh." 2>/dev/null || true
+          gh release upload tools /tmp/ndk-lite-r27c.tar.xz /tmp/ndk-lite-r27c.tar.xz.sha256 --clobber
+
+  # Job 2: ARM64 runner par prebuilt .NET tools (dmsh_xlate, nx_extract) build karta hai
+  prebuilt:
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build the porter's .NET tools with runtimes that start on phones
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/make_prebuilt.sh
+
+  # Job 3: Android APK build, sign aur release mein publish karta hai
+  apk:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Does the APK need rebuilding?
+        id: chg
+        run: |
+          build=true
+          if [ "${{ github.event_name }}" = "push" ] && git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null; then
+            other=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -Ev '^(app/src/main/assets/nx2a/payload/|docs/|README\.md$|tools/make_prebuilt\.sh$|\.github/workflows/)' || true)
+            [ -z "$other" ] && build=false
+            echo "changed outside the payload: ${other:-nothing}"
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        if: steps.chg.outputs.build == 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.chg.outputs.build == 'true'
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Bundle proot and the Ubuntu rootfs
+        if: steps.chg.outputs.build == 'true'
+        run: |
+          bash tools/fetch_proot.sh
+          bash tools/fetch_rootfs.sh
+
+      - name: The payload manifest must match the payload files
+        run: |
+          python3 tools/make_manifest.py
+          git diff --exit-code app/src/main/assets/nx2a/payload/payload.json || {
+            echo "payload.json is out of date: run  python3 tools/make_manifest.py --bump  and commit"
+            exit 1
+          }
+
+      - name: Signing key
+        if: steps.chg.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KS_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KEYSTORE_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.p12"
+            {
+              echo "KS_FILE=$RUNNER_TEMP/release.p12"
+              echo "KS_PASS=$KEYSTORE_PASS"
+              echo "KS_ALIAS=$KEYSTORE_ALIAS"
+            } >> "$GITHUB_ENV"
+          else
+            bash tools/signing_key.sh
+          fi
+
+      - name: Build the signed release APK
+        if: steps.chg.outputs.build == 'true'
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          gradle --no-daemon assembleRelease
+
+      - uses: actions/upload-artifact@v4
+        if: steps.chg.outputs.build == 'true'
+        with:
+          name: nx2android-apk
+          path: 'app/build/outputs/apk/release/*.apk'
+
+      - name: Publish the APK as the latest release
+        if: steps.chg.outputs.build == 'true' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "$(ls app/build/outputs/apk/release/*.apk | head -1)" nx2android.apk
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          {
+            echo "Built from $GITHUB_SHA."
+            echo
+            echo '```'
+            tail -c 1500 "${SIGN_LOG:-/dev/null}" 2>/dev/null
+            echo '```'
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create latest nx2android.apk --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "nx2android (latest build)" \
+            --notes-file "$RUNNER_TEMP/notes.md"
